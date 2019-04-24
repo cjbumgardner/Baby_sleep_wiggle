@@ -67,6 +67,7 @@ def readbaby(filepath,mean=True,sleep=True,csv=False,xlsx=False):
     return db    #db=(t,x,y,z,sleepvalue,skip) if sleep=True, db=(t,x,y,z) if sleep=False
 
 def picture(data,a,b):
+    """data"""
     picx=sns.tsplot(data.iloc[a:b].x,time=data.iloc[a:b].index,color="red")
     axesx=picx.axes
     axesx.set(ylim=(-1.1,1.1))
@@ -140,7 +141,7 @@ class sleep(object):
             if command=="h":
                 center=selfsim(self.window[0],self.window[1],self.data)
                 print("Initialize the features.")
-                step=input("Input the step size in seconds (>2**10): ")
+                step=input("Input the step size (>2**10): ")
                 tolerance=input("Input a tolerance (~10**-2): ")
                 maxsteps=input("Input max number of steps: ")
                 def run_hdim(rnd):    
