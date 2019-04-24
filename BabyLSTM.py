@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Spyder Editor
 
-This is a temporary script file.
-"""
 """LSTM network for determining the probability that a baby is sleeping from accelerometer
 data of 3D acceleration vectors recorded with an average frequency of 6Hz. 
 
