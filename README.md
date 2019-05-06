@@ -1,13 +1,10 @@
-# Baby_sleep_wiggle
-RNN and labeling tool for determining sleep habits of infants from accelerometer data.
+# Baby_sleep_wiggle 2017
+RNN design and labeling tool for determining sleep habits of infants from accelerometer data.
 
-The sleepmachine.py is a primative graphical interface to label data as sleeping or not sleeping. Amongst some tools to choose
-window size for the timeseries data, label, and store timeseries data (with cpickle), it also contains a helper function that computes the largest window (forward in time) where 
-there is no change (relative to a user defined interval) in a quantity that is proportional to a Hausdorff-like dimension. 
-Basically, it helps you find a largest window where the "wiggle" of the baby is roughly the same as that of a chosen segment of 
-time. 
+sleepmachine.py is a primitive graphical interface to label data as sleeping or not sleeping. It is meant to be used in conjunction with poorly labeled data to help a human label the data more precisely. Since sleeping or not sleeping is all that is of interest in this project (more moving/ less moving), having an approximate bedtime/nap time labeling would be enough, alongside the helper function mentioned below, to determine a more accurate time of falling asleep and waking up. The labeling interface simply helps the user easily plot the data over specified window sizes and label the data for a particular window. The helper function computes the largest window (forward in time) where there is no change (relative to a user defined interval) in a quantity that is proportional to an ad-hoc "statistical Hausdorff-like dimension". Basically, it helps you find a largest window where the "wiggle" of the baby is roughly the same as that of a chosen segment of time. 
 
-The BabyLSTM.py is a training program for a bidirectional recurrent neural network using LSTM cells. It uses
-Tensorflow. It assumes the input data is stored in a cpickle format. 
+newBabyLSTM.py is a recurrent neural network built with Tensorflow. I call the network style a "wedding cake" network since it is built with "tiers" of standard stacked RNN style cells (there are choices for gru or lstm for experimentation) for sequence to sequence modeling. Before each tier, the length of the sequence is shortened beforethe stacked rnn cells. The shortening is due to a CNN style window and stride reshaping of the data through time. Taking for example a timeseries with feature values taken every second, the window might group 3 second intervals together ("window size") every 2 seconds ("stride"). With respect to the intention of this project, we only wish to find if sleeping is happening over one minute intervals, and we have (after cleaning) data at a rate of 1 Hz. For instance, we could consider having a 3 tiered network, window size and stride both 4 before each tier, and the output would be a feature for every 64 seconds. 
 
-This program is for a larger research project for the Nutional Science Department at UC Davis. 
+Although newBabyLSTM.py was made for outputting sleep/no sleep, it has the flexibility to have probabilistic/ one-hot output for any number of categories. Also, it has the option to have non-sequential, categorical output (a dense layer output). 
+ 
+This program is for a larger research project for the Nutritional Science Department at UC Davis. 

@@ -1,297 +1,594 @@
-# -*- coding: utf-8 -*-
-
-"""LSTM network for determining the probability that a baby is sleeping from accelerometer
-data of 3D acceleration vectors recorded with an average frequency of 6Hz. 
-
-Design 1: An two phase LTSM network. The first will look at a (outer) time window, T_o, of 15-30 seconds (TBD). 
-The LSTM cell (cell size on the order of 10-30) will look at readings from every 1-5 seconds (inner 
-time window T_i) within T_o. The inner LSTM cell will produce outputs chronologically partioning
-the outer window, and the outputs to the inner LSTM cell will be inputs to the outer LSTM cell. 
-The outer time window will slide along the entire time series sliding forward in time by 1-5 
-seconds (thus overlapping windows much like a CNN window).
-the 
-
+"""
+@author: Christopher Bumgardner
 """
 
-"""
-
-
-
-
-tf.nn.softmax #https://www.tensorflow.org/api_docs/python/tf/nn/softmax
-
-tf.nn.sigmoid_cross_entropy_with_logits  #https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
-
-x = tf.placeholder(tf.float32, shape=[None, 3,timeintervalTBD]) #None here for batchsize TBD
-
-with tf.Session as sess:
-    sess.run(graph, feed_dict={placeholder:blah,etc})
-
-targetvalue = tf.placeholder(tf.float32, shape=[None,1]) # 1D for Awake=0 Asleep=1
-
-https://www.tensorflow.org/programmers_guide/threading_and_queues
-
-The above is for possibly helping with the "triangle" style LSTM where we need to 
-write output of several rounds of the LSTM cell "sliding" through an interval, then use 
-these as input to another LSTM cell. If nothing else is more authentic for this task...
-
-NOTES:
-Possible cell wrappers: tf.contrib.rnn.AttentionCellWrapper
-This is similar to a kind of design thought of first where there is a RNN "window" that 
-is used to observe outputs of a "sub"-RNN bi-directional structure. Not sure of the exact
-structure of this wrapper funtion.
-
-
-
- """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from typing import Optional, List, Text, Dict
+import math
+from pathlib import Path
 import tensorflow as tf
 import numpy as np
-import threading
-import Queue
-from random import shuffle
-import cPickle
-from __future__ import division
-#undefined variables: 
-#files, capacity, num_reader_threads, batch_size, num_epochs=
-class config(object):
-    def __init__(self):
-        #the settings for the LSTM bidirectional cells
-        self.bidir_num_units=[60,60]
-            #self.output_keep_prob=   for now leaving dropout out 
-            #self.max_grad_norm=  leaving out any clipping with adam optimizer for now
-        
-        #for AdamOptimizer. 
-        self.learning_rate=0.001
-        self.beta1=0.9 #first moment decay rate for gradients
-        self.beta2=0.99 #second moment decay rate for gradients
-        self.epsilon=0.01
-        
-        #for queue runners and batch size for evaluating model 
-        self.batch_size=10
-        self.num_reader_threads=30#number of threads that are reading data from pickle into tf.tensor
-        self.capacity=3*self.batch_size #capacity for the queue storing tf.tensors for batches
-        self.sample_time_duration=30 # this the time duration of a single mark of sleep y/n. Most likely 15-60sec
-        
 
 
-#data files stored as dictionaries of np.ndarray {"data":shape=(None,sequence_length,time_chunk,3D),
-#"labels":shape=(None,sequence_length,1),"sequence_length":shape=(None,1)}
-def unpickle(filepath):
-    with open(filepath,"rb") as obj:
-        filey=cPickle.load(obj)
-    return filey
+"""A 'wedding cake' style RNN network classifying subsequence information.
 
-class batcher(object):
-    def __init__(self,files,config):
-        self._files=files
-        num_reader_threads=config.num_reader_threads
-        capacity=config.capacity
-        batch_size=config.batch_size
-        sample_time=config.sample_time_duration
-        
-        self._data=data=tf.placeholder(dtype=tf.float32,shape=[1,None,sample_time])
-        self._labels=labels=tf.placeholder(dtype=tf.float32,shape=[1,None,1])
-        self._sequence_length=sequence_length=tf.placeholder(dtype=tf.int32,shape=[1,1])
-        
-        #queues and operations
-        
-        self._file_q=Queue.Queue(maxsize=len(files))
-        self._batch_q=tf.PaddingFIFOQueue(capacity,(tf.float32,tf.float32),shapes=[[1,None,sample_time],[1,None,1],[1,1]],\
-                    name="Batch_Queue")
-        self._enqueue_op=self._batch_q.enqueue({"data":data,"labels":labels,"sequence_length":sequence_length},name="Batch_Enq_Op")
-        self._output_op=self._batch_q.dequeue_many(batch_size,name="Batch_Deq_Op")
+A RNN network for reading sequential information and outputting a classification
+or probability variable for sequential subsequences. For example, if one took  
+accelerometer readings from a wearable device at the rate of 1 Hz and wished to
+determine the probability the wearer was either running, sitting, or sleeping
+over each one minute interval. 
 
-    def start_batch_runners(self,sess,coord):
-        
-        #python file thread. puts files into file_q and shuffles the files before enqueueing 
-        def file_thread(coord,files,file_q):
-            def filer(coord,files,file_queue):
-                while not coord.should_stop():
-                    shuffle(files)
-                    for f in files:
-                        if not coord.should_stop(): #put files into q
-                            file_queue.put(f)
-                        else:                     #if stopped during enq round then dump the q
-                            while not file_queue.empty():
-                                file_queue.get(block=False)
-                                file_queue.task_done()
-                            break
-            file_thread=threading.Thread(target=filer,args=(coord,files,file_q),name="Filer_Thread")
-            file_thread.daemon=True
-            return file_thread
+The design has several tunable parameters for the network geometry. The 'tiers'
+to the 'wedding cake' are standard multilayered RNN networks with variable
+depth and number of units in each layer. Before each tier, there are options 
+for a CNN style window and stride over the timeseries. Meaning, several 
+sequential units of time (the window) can be read by single RNN cells, and then
+the window moves through the sequence by a specified step size (the stride). 
+Again, much like convolutions in CNNs, the sequence length will shorten after 
+each tier.
+
+There are options for either sequential categorical output or simply one 
+categorical output. This is specified by adding a dense layer or not in a 
+params class. 
+
+In the params class, the network geometry is specified by the following.
+tiers = {0:[rnn cell size in 1st layer, 2nd layer],
+        1:[rnn cell size 1st layer, 2nd layer, etc],etc}
+window_size = {0: window size for before being fed into 1st rnn tier,
+               1:window size for before being fed into 2nd rnn tier,etc}
+stride = {0: stride for before being fed into 1st rnn tier,
+          1: stride for before being fed into 1st rnn tier, etc} 
+
+These are parameters for a reshaping of the data, like convolutions, for feeding 
+into a standard mulitlayered RNN (lstm or gru). They should be specified before 
+each tier, so len(stride)=len(window_size)=len(tiers).
+"""
 
 
-        #python unpickle reader threads
-        def reader_threads(coord,sess,file_queue,enqueue,num_reader_threads):
-            def reader():
-                while not coord.should_stop():
-                    x=file_queue.get()
-                    file_queue.task_done()
-                    x=unpickle(x) #dict of data,labels,sequence_length
-                    sess.run(enqueue, feed_dict={data:x["data"],labels:x["labels"],sequence_length:x["sequence_length"]})
-            reader_threads=[]
-            for i in range(num_reader_threads):
-                reader_thread=threading.Thread(target=reader,name="Reader_Thread{}".format(i))
-                reader_thread.daemon=True   
-                reader_threads.append(reader_thread)
-
-            return reader_threads
-        self._py_threads=[file_thread(coord,self._files,self._file_q)]+reader_threads(coord,sess,self._file_q,\
-                                                                          self._enquque_op,self.num_reader_threads)
-        for thread in self._py_threads:
-            thread.start()
- 
-         
-        return self._py_threads
-    @property
-    def batch(self):
-        return self._output_op # returns op to produce dict of data,labels,sequence_length
-        
-        
-
-class baby_rnn(object):
-    def __init__(self,input_list,config,is_training):
-        self.inputs=input_list["data"]
-        self.labels=input_list["labels"]
-        self.seq_length=input_list["sequence_length"]
-        
-        self.output_keep_prob=tf.placeholder(tf.float32)
-        #the bidirectional LSTM stack
-        bidir_cells={}
-        for d in ["fw","bw"]:
-            cells=[]
-            i=1
-            for num_units in config.bidir_num_units:
-                cell=tf.nn.rnn_cell.LSTMCell(num_units=num_units,state_is_tuple=True)
-                #cell=tf.nn.rnn_cell.DropoutWrapper(cell,output_keep_prob=self.output_keep_prob) as of now it seems
-                #the dropoutwrapper in tf affects dropping memory states (7/17) which causes memory state exp growth
-                #but also isn't in line with wanting to drop only output to next layer within timestep and not memory drop
-                cells.append(cell)
-                i+=1
-            bidir_cells[d]=tf.nn.rnn_cell.MultiRNNCell(cells)
-        outputs_bi,_=tf.nn.bidirectional_dynamic_rnn(cell_fw=bidir_cells["fw"],\
-                cell_bw=bidir_cells["bw"],dtype=tf.float32,seqence_length=self.seq_length,inputs=self.inputs)
-        num_outputs=config.bidir_num_units[-1]
-        W=tf.get_variable("w_logit",[num_outputs],dtype=tf.float32)
-        B=tf.get_variable("b_logit",[],dtype=tf.float)
-        output_logits=tf.einsum('ijk,k->ij',outputs_bi,W)+B
-        self._output_sigmoid=tf.sigmoid(output_logits)
-        
-        
-        max_seq_length=max(self.seq_length)
-        output_xtropy=tf.nn_sigmoid_cross_entropy_with_logits(logits=output_logits, labels=self.labels)
-        mask=tf.convert_to_tensor([[1 for _ in range(self.seq_length[i])]+[0 for _ in range(max_seq_length-self.seq_length[i])] \
-            for i in range(len(self.seq_length))],dtype=tf.float32)
-        flat_output_xtropy=tf.reshape(output_xtropy,[-1])
-        flat_mask=tf.reshape(mask,[-1])
-        self._loss=loss=tf.reduce_mean(tf.boolean_mask(flat_output,flat_mask))
-        if is_training==False:
-            return
-        #tvars=tf.trainable_variables()
-        #clipping. doesn't necessarily make sense with ADAM which already normalizes the grad when used in steps
-        #grads, _ = tf.clip_by_global_norm(tf.gradients(loss, tvars),config.max_grad_norm)
-        #train_step = tf.contrib.opt.ScipyOptimizerInterface(
-               # loss,
-               # method='L-BFGS-B',
-                #options={'maxiter': iterations}) an implementation of inverse hessian optimization
-                #as I can tell now, seems tf only has sgd methods. newton type methods can be pulled from scipy
-        #adam optimizer variables                              
-        lr=config.learning_rate
-        b1=config.beta1
-        b2=config.beta2
-        e=config.epsilon
-        
-        optimizer=tf.train.AdamOptimizer(learning_rate=lr,beta1=b1,beta2=b2,epsilon=e)
-        self._gradient=tf.placeholder(tf.float32)
-        self._global_step=tf.Variable(0,name="global_step",trainable=False)
-        self._train_op=optimizer.minimize(loss,grad_loss=self._gradient,global_step=self._global_step) #gate_gradients=GATE_OP, grad_loss=None place to store gradients if needed
-        
-        
-    @property
-    def train_op(self):
-        return self._train_op
-        
-    @property
-    def outputs(self):
-        return self._output_sigmoid
+class params(object):
+    """Parameters for RNN network design, training, and logging.
     
-    @property
-    def loss(self):
-        return self._loss
-    
-    @property
-    def gradient(self):
-        return self._gradient
-    @property
-    def global_step(self):
-        return self._global_step
-    
-
-#def run_net(session,model,eval_op=None):
-    
-def variable_summaries(var_name,var):
-    a=tf.summary.scalar(var_name,var)
-    b=tf.summary.scalar(var_name+"_max",tf.reduce_max(var))
-    c=tf.summary.scalar(var_name+"_l2norm",tf.norm(var))
-    d=tf.summary.histogram(var_name+"_histogram",var)
-    return a,b,c,d
+    Attributes: 
+        cell_type: string "lstm" or "gru", default "lstm"
+        tiers: list of lists of ints [[int,],[int,],] (see module docs)
+        window_size: list of ints (see module docs), default 1
+        strides: list of ints (see module docs), default 1
+        use_dense_layer_output: Boolean, Default False. This is for sequence to 
+            category models where only one value is categorized, or a 
+            probability distribution over categories. 
+        dense_layer_args: optional dense layer args including number of units
+        adam_opt_args: Dict of values for tf.adamoptimizer
+        lstm_cell_args: Dict of values for tf.keras.layers.LSTMCell not 
+            including number of units
+        gru_cell_args: Dict of value for tf.keras.layers.GRUCell not including
+            number of units
+        tens_to_log: Dict of named tensors for logging and viewing during 
+            training
+        checkpoint_path: filepath where model checkpoints will be stored during
+            training
+        predict_batch_size: batch size when using the estimator predictor, 
+            possibly only at the end of training. Note: this has nothing to do 
+            with function 'cake_predict'
+        save_checkpoints_steps: how many trainging steps before saving the next
+            checkpoint,
+        keep_checkpoint_max: max number of checkpoints to keep
+        save_summary_steps: number of training steps before saving next summary
+            for tensorboard usage
+        logging_step: number of steps before next command line output of tens_to_log
+    """
+    def __init__(self,
+                 cell_type: Text = "lstm",
+                 tiers: Dict[int:List[int]] = {1:[1]},
+                 window_sizes: List[int] = [1],
+                 strides: List[int] = [1],
+                 use_dense_layer_output : bool = False,
+                 dense_layer_args : Dict = {"units": None,
+                                           "activation":None,#don't change this
+                                           "use_bias":True,
+                                           "kernel_initializer":'glorot_uniform',
+                                           "bias_initializer":'zeros',
+                                           "kernel_regularizer":None,
+                                           "bias_regularizer":None,
+                                           "activity_regularizer":None,
+                                           "kernel_constraint":None,
+                                           "bias_constraint":None,
+                                           },
+                 lstm_cell_args : Dict = {"activation":'tanh',
+                                        "recurrent_activation":'hard_sigmoid',
+                                        "use_bias":True,
+                                        "kernel_initializer":'glorot_uniform',
+                                        "recurrent_initializer":'orthogonal',
+                                        "bias_initializer":'zeros',
+                                        "unit_forget_bias":True,
+                                        "kernel_regularizer":None,
+                                        "recurrent_regularizer":None,
+                                        "bias_regularizer":None,
+                                        "kernel_constraint":None,
+                                        "recurrent_constraint":None,
+                                        "bias_constraint":None,
+                                        "implementation":1,
+                                        },
+                 gru_cell_args : Dict = {"activation":'tanh',
+                                        "recurrent_activation":'hard_sigmoid',
+                                        "use_bias":True,
+                                        "kernel_initializer":'glorot_uniform',
+                                        "recurrent_initializer":'orthogonal',
+                                        "bias_initializer":'zeros',
+                                        "kernel_regularizer":None,
+                                        "recurrent_regularizer":None,
+                                        "bias_regularizer":None,
+                                        "kernel_constraint":None,
+                                        "recurrent_constraint":None,
+                                        "bias_constraint":None,
+                                        "implementation":1,
+                                        "reset_after":False,
+                                        },
+                 adam_opt_args : Dict = {"learning_rate": None,
+                                         "epsilon": None,
+                                         "beta_1": None,
+                                         "beta_2": None,
+                                         },
+                 clip_norm : Optional[float] = None,
+                 dropout_training = 0,
+                 recurrent_dropout_training = 0,
+                 tens_to_log = None,
+                 checkpoint_path = None,
+                 predict_batch_size = 30,
+                 save_checkpoints_steps = 100,
+                 keep_checkpoint_max = 10,
+                 save_summary_steps = 10,
+                 logging_step = 10,
+                 ):
+        """Initialize network geometry and training parameters.
+        
+        Raises: ValueError if there is a mismatch in the network geometry specs.
+        For each tier, the network needs a specification of window size and 
+        stride, so the list lengths specifying these need to all be the same.
+        
+        """
+        
+        if (len(tiers)!=len(window_sizes) or len(window_sizes)!=len(strides)):
+           raise ValueError("Mismatch in network geometry specs. Need number of"
+                            " tiers = number of window size specs, or number of"
+                            " window specs = number of stride specs.")
+        
+        
+        self.cell_type = cell_type 
+        self.tiers = tiers, 
+        self.window_sizes = window_sizes,
+        self.strides = strides,
+        self.use_dense_layer_output = use_dense_layer_output
+        self.dense_layer_args = dense_layer_args,
+        self.lstm_cell_args = lstm_cell_args,
+        self.gru_cell_args = gru_cell_args,
+        self.adam_opt_args = adam_opt_args,
+        self.clip_norm = clip_norm,
+        self.dropout_training = 0,
+        self.recurrent_dropout_training = recurrent_dropout_training,
+        self.tens_to_log = tens_to_log,
+        self.checkpoint_path = None,
+        self.predict_batch_size = 30,
+        self.save_checkpoints_steps = 100,
+        self.keep_checkpoint_max = 10,
+        self.save_summary_steps = 20,
+        self.logging_step = 10
         
     
-
+def time_conv_reshape(arr,window,stride):
+    """Reshape the sequence data for a convolutional style network.
     
-def main():    
-    train_validate_config=config()
-    graph=tf.Graph()
-    with graph.as_default():
-        #could change range of uniform distribution
-        initializer = tf.random_uniform_initializer(0,1)
-       
-        with tf.name_scope("Train"):
-            train_batcher=batcher(train_files,train_validate_config)
-            with tf.variable_scope("Model",initializer=initializer):
-                train_model=baby_rnn(train_batcher.batch,config=train_validate_config,is_training=True) 
-                t_l=tf.summary.scalar("train_loss",train_model.loss)
-                a,b,c,d=variable_summaries("gradient",train_model.gradient)
-        merged_train=tf.summary.merge([t_l,a,b,c,d])       
-        with tf.name_scope("Validate"):
-            validate_batcher=batcher(validate_files,train_validate_config)
-            with tf.variable_scope("Model",reuse=True):
-                validate_model=baby_rnn(validate_batcher.batch,config=train_validate_config)
-                v_l=tf.summary.scalar("validate_loss",validate_model.loss)
-        merged_validate=tf.summary.merge([v_l])    
-        #will write code later for actually using the RNN for data analysis
-        """with tf.name_scope("Test"):
-            test_set=batcher(test_files,reader_threads=1,batch_size=1)
-            with tf.variable_scope("Model",reuse=True):
-                test_model=baby_rnn(test_set.batch,config= MISSING  )"""
+    Converts the sequence 'arr' to another sequence by flattening features in
+    time windows of size = window for every window beginning at a time index 
+    that is a multiple of the value 'stride'. 
+    
+    Args: 
+        arr: tf.tensor of shape [batch_size, time_steps, features]
+        window: int window size 
+        stride: int stride length
+    Returns: 
+        tf.tensor of shape [batch_size, new_time_steps, features*window]. Here
+        new_time_steps = n + 1 (for n below)
+    """
+    
+    bat, steps, feat = arr.get_shape().as_list()
+    r = tf.floormod((steps - window), stride)
+    n = math.ceil((steps - window)/stride)
+    
+    def padder(n=n,r=r,feat=feat,steps=steps,bat=bat,arr=arr):
+        """Pad function."""
+        pad = tf.zeros([bat, stride - r, feat],tf.float32)
+        return tf.concat([arr, pad], 1) 
+     
+    arr = tf.cond(tf.equal(r,0), lambda: arr, padder)
+    steps = tf.cond(tf.equal(r,0), lambda: steps, lambda: steps + stride -r)
+    last_step = steps - window + 1 
+    
+    def c(i,a,b):
+        """Condition tf.while_loop"""
+        return tf.less(i,window)
+    
+    def b(i,new_arr,arr):
+        """Body tf.while_loop. Appends ith value of windows to new_arr."""
+        new_arr = tf.concat([new_arr,arr[:, i:last_step + i:stride, :]], axis=2)
+        return i+1,new_arr,arr
+    
+    i = tf.constant(1)
+    new_arr = arr[:, 0: last_step: stride, :]
+    new_arr.set_shape([bat,n+1,None])
+    _,new_arr,_=tf.while_loop(c,
+                              b,
+                              loop_vars=[i,new_arr,arr],
+                              shape_invariants=[i.get_shape(),
+                                                tf.TensorShape([bat,n+1,None]),
+                                                arr.get_shape(),
+                                                ],
+                              )
+    new_arr.set_shape([bat,n+1,feat*window])
+    return new_arr  
+
+     
+def rnn_stack(params=None,
+              tier : int = None,
+              last_tier = False,
+              dropout = 0,
+              recurrent_dropout = 0,
+              ):
+    """MultiRnn cell. Options
+    
+    Args: 
+        params = params class with cell args
+        tier = int designating the tier number
+        """
+    layers = params.tiers[tier]
+    def memory_cell(num_cells,last_layer=False):
+        """"""
+        if params.cell_type == "gru":
+            kwargs = params.gru_cell_args
+            if last_layer == True: 
+                kwargs["activation"] = None
+            cell = tf.keras.layers.GRUCell(num_cells,
+                                           dropout = dropout,
+                                           recurrent_dropout = recurrent_dropout,
+                                           **kwargs,
+                                           )
+        if params.cell_type == "lstm":
+            kwargs = params.lstm_cell_args
+            if last_layer == True: 
+                kwargs["activation"] = None
+            cell = tf.keras.layers.LSTMCell(num_cells,
+                                            dropout = dropout,
+                                            recurrent_dropout = recurrent_dropout,
+                                            **kwargs)
+        return cell 
+    
+    if last_tier == False:
+        cells = [memory_cell(l) for l in layers]
+    else:
+        cells = [memory_cell(l) for l in layers[:-1]]
+        cells.append[memory_cell(layers[-1],last_layer=True)]#output is logits
+    cell_stack = tf.keras.layers.RNN(cells,return_sequences=True)
+    return cell_stack
+
+
+def cake_fn(features,labels,mode,params):
+    """Main 'wedding cake' style network function.
+    
+    Args:
+        features: dict of features to be fed into model
+        labels: tf.tensor of labels
+        mode: tf.estimator.ModeKeys 
+        params: dict of parameters for model
+    """
+    
+    x = features["x"]
+    tiers = params.tiers
+    window_sizes = params.window_sizes
+    strides = params.strides
+    
+    if mode == tf.estimator.ModeKeys.TRAIN:
+        dropout = params.dropout_training
+        recurrent_dropout  = params.recurrent_dropout_training
+    else: 
+        dropout = 0
+        recurrent_dropout = 0
+      
+    for i in range(len(tiers)):
+        x = time_conv_reshape(x, window_sizes[i], strides[i])
+        stack = rnn_stack(params=params,
+                          tier=i, 
+                          dropout = dropout,
+                          recurrent_dropout = recurrent_dropout,
+                          )
+        x = stack(x)
         
+    if params.use_dense_layer_output == True:
+        dense = tf.keras.layers.Dense(**params.dense_layer_args)
+        logits = dense(x) 
+    else: 
+        logits = x 
         
+    def loss_fn(y_true,y_pred):
+        """Xentropy loss function for sequence output or category output. 
         
-        writer=tf.summary.FileWriter(MISSING path,graph=graph)
-        init_op=tf.global_variable_initializer()  
-        with tf.Session() as sess:
-            sess.run(init_op)
-            coord = tf.train.Coordinator()
-            train_threads=train_batcher.start_batch_runners(sess,coord)
-            validate_threads=validate_batcher.start_batch_runners(sess,coord)
+        Args:
+            y_true: one hot true label
+            y_pred: logit output of network
+        """ 
+        loss = tf.nn.softmax_cross_entropy_with_logits_v2(y_true,
+                                                          y_pred,
+                                                          axis=-1,
+                                                         )
+        loss = tf.reduce_mean(loss,name="loss")
+        return loss
+    
+    depth = logits.get_shape().as_list()[-1]
+    predictions = {"probabilities": tf.nn.softmax(logits,
+                                                  axis=-1,
+                                                  name="probabilities",
+                                                  ),
+                  "labels":tf.one_hot(tf.argmax(logits,axis=-1),
+                                  depth,axis=-1,
+                                  name="output_labels",
+                                  ),
+                  }
+
+    if mode == tf.estimator.ModeKeys.PREDICT:
+        return tf.estimator.EstimatorSpec(mode = mode,
+                                          predictions = predictions,
+                                          )
+
+    loss = loss_fn(labels,logits)
+    reg_loss = tf.losses.get_regularization_losses()
+    loss = loss + tf.reduce_sum(reg_loss)
+    acc = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(predictions["labels"],
+                                                    axis=-1),
+                                          tf.argmax(labels,axis=-1)),
+                                 tf.float32),
+                         name="accuracy_on_average",
+                         )
+    tf.summary.scalar("average_accuracy",acc)
+    tf.summary.scalar("loss_with_regularization",loss)
+   
+    if mode == tf.estimator.ModeKeys.TRAIN:
+        optimizer = tf.train.AdamOptimizer(**params.adam_opt_args)
+        grads,varis = [*zip(*optimizer.compute_gradients(loss=loss))]
+        if params.clip_norm != None:
+            grads = [tf.clip_by_average_norm(grad,
+                                             params.clip_norm) for grad in grads]
+        train_op = optimizer.apply_gradients([*zip(grads,varis)],
+                                             global_step = tf.train.get_global_step(),
+                                            )
+        return tf.estimator.EstimatorSpec(mode = mode,
+                                          loss = loss,
+                                          train_op = train_op,
+                                          )   
+    eval_metric_ops = {"accuracy": acc}                                    
+    return tf.estimator.EstimatorSpec(mode = mode,
+                                      loss = loss,
+                                      eval_metric_ops = eval_metric_ops,
+                                      )
+    
+    
+class cake_train_eval(object): 
+    """Train and evaluate class for model function.
+    
+    For training a model and/or evaluating fitness of a model on labeled 
+    data. params class can be updated if needed while between training rounds. 
+    
+    Attributes:
+        train_data: dict or npz file of dict in the form of {"x":,"y":}
+        eval_data: dict or npz file of dict in the form of {"x":,"y":}
+        params: params class object of model parameters for logging, training, 
+                etc. See class function params. 
+        model_dir: directory where model checkpoints are saved/restored
+        model_fn: the model function to be fid in to tf.estimator.Estimator
+    """
+    
+    
+    def __init__(self,
+                 train_data=None,
+                 eval_data=None,
+                 params=None,
+                 model_dir=None,
+                 model_fn=cake_fn,
+                 ):
+        """Initialization of attributes."""
+        try: 
+            self.train_data = np.load(train_data)
+        except FileNotFoundError:
+            self.train_data = train_data
+        try: 
+            self.eval_data = np.load(eval_data)
+        except FileNotFoundError:
+            self.eval_data = eval_data
+        
+        self.model_fn = model_fn
+        self.model_dir = model_dir
+        self._params = params
+        self._config_set()
+        self._make_model()
+    
+    @property
+    def params(self):
+        """params property fn."""
+        return self._params
+    
+    @params.setter
+    def params(self,new):
+        """Sets params and updates configs and model. 
+        
+        Args: 
+            new: a params class object. 
+        """
+        self._params = new
+        self._config_set()
+        self._make_model()
+        
+    def _config_set(self):
+        """Makes the config for model Estimator. 
+        """
+        p = self._params
+        self._config = tf.estimator.RunConfig(save_checkpoints_steps = p.save_checkpoints_steps,
+                                              keep_checkpoint_max = p.keep_checkpoint_max,
+                                              save_summary_steps = p.save_summary_steps
+                                              )
+        
+    def _make_model(self):
+        """Makes the Estimator model with model_fn. 
+        """
+        self._model = tf.estimator.Estimator(model_fn=self.model_fn,
+                                             model_dir=self.model_dir,
+                                             config=self._config,
+                                             params=self._params,
+                                            )   
+    
+    def train(self):
+        """Train and evalutate method. 
+        
+        Returns: The results after trained model is evaluated on eval_data.
+        """
+        p = self._params
+        if self.train_data != None:
+            tens_to_log = self.params.tens_to_log
+            logging_hook = tf.train.LoggingTensorHook(tensors = tens_to_log,
+                                                      every_n_iter = p.logging_step,
+                                                      )
+            t_fn = tf.estimator.inputs.numpy_input_fn(x = {"x": self.train_data["x"]},
+                                                      y = self.train_data["y"],
+                                                      batch_size = p.batch_size,
+                                                      num_epochs = None,
+                                                      shuffle = True,
+                                                      )
+            self._model.train(input_fn = t_fn,
+                              steps = self.params.training_steps,
+                              hooks = [logging_hook],
+                              )
+                
+        if self.eval_data != None:
+            e_fn = tf.estimator.inputs.numpy_input_fn(x = {"x": self.eval_data["x"]},
+                                                      y = self.eval_data["y"],
+                                                      num_epochs = 1,
+                                                      shuffle = False,
+                                                      )
+            eval_results = self.model.evaluate(input_fn = e_fn,
+                                               checkpoint_path = self.model_dir,
+                                               )
+            print(eval_results)
             
-            for i in range(num_epochs):
-                if i%10==0:
-                    loss,summary=sess.run(validate_model.loss,merged_validate)
-                    print("The validation loss at epoch {}: {}".format(i,loss))
-                    writer.add_summary(summary,i)
-                else:
-                    loss, summary=sess.run(train_model.loss,merged_train)
-                    writer.add_summary(summary,i)
-                                    
-            test_tread=test_set.start_batch_runners(sess,coord)        
-            #do test with final net settings        
     
-            coord.request_stop()
-            coord.join([train_threads,validate_threads,test_thread])
-            
-            
-            writer.add_graph(sess.graph)
+class cake_predict(object): 
+    """Predictor creator and evaluator for streaming input.
     
-
-
+    A predictor class that is mostly generic except for the _serving_input_fn
+    that specifies the serving_input_receiver_fn for tf.estimator.export. 
+    Initialization with saved_path = None creates a new saved_model, and
+    creates a predictor function from either the most recent saved 
+    model in model_dir or a particular saved_model in 'saved_model' dir.
+    Can also update the predictor with a newly trained model in model_dir. 
+    Predictions are saved in a npz file as a dict with the same input dict keys 
+    modified by the suffix "_pred". 
+    
+    Attributes:
+        model_fn: (Optional) a tf model that can be fed into 
+                  tf.estimator.Estimator, default is cake_fn.
+        model_dir: (Optional) diretory path for the trained model, default is
+                    "model".
+        saved_path: (Optional) directory path, "most_recent", None (default). 
+                    The "most_recent" option finds the last saved_model. By
+                    default, a new saved model is created from the last model 
+                    in the model_dir. 
+    """
+    
+    def __init__(self,
+                 model_fn=cake_fn,
+                 model_dir: Optional[str] = "model",
+                 saved_path : Optional[str] = None,
+                ):
+        """
+        Initialization function for class variables. 
+        """
+        self.model_fn = model_fn   
+        self.model_dir = model_dir
+        if saved_path == None:
+            self.update_predictor()
+        elif saved_path == "most_recent":
+            subdirs = [x for x in Path('saved_model').iterdir() if x.is_dir()\
+                       and 'temp' not in str(x)]
+            self.saved_path = "saved_model/"+str(sorted(subdirs)[-1])
+            self._build_predictor()
+        else:
+            self.saved_path = saved_path
+            self._build_predictor()
+        
+    def _serving_input_fn(self): 
+        """Serving input_fn that builds features from placeholders
+    
+        Returns:
+            tf.estimator.export.ServingInputReceiver
+        """
+        seq = tf.placeholder(dtype=tf.float32, shape=[None, None], name='seq')
+        features = {'seq': seq}
+        return tf.estimator.export.build_raw_serving_input_receiver_fn(features)
+    
+    def update_predictor(self):
+        """Update predictor with newly trained model.
+        
+        """
+        estimator = tf.estimator.Estimator(self.model_fn,
+                                           self.model_dir,
+                                           params={},
+                                           )
+        self.saved_path = estimator.export_saved_model('saved_model', 
+                                                          self._serv_input_fn(),
+                                                          )
+        self._build_predictor()
+        
+    def _build_predictor(self):
+        """Sets _predict_fn as a tf.contib.predictor.from_saved_model().
+        
+        Raises:
+            OSError: When self.saved_path can't be found.
+        """
+        try: 
+            predict_fn = tf.contrib.predictor.from_saved_model(self.saved_path)
+        except OSError as err: 
+            print(f"OSError: {err}")
+        self._predict_fn = predict_fn
+        
+    def predict(self,
+                data : Optional[Dict] = None,
+                data_path : Optional[str] = None,
+                predicted_data_dir: Optional[str] = "predictions",
+                ):
+        """Predict method that saves and outputs predictions.
+        
+        Args: 
+            data: Optional dict of numpy arrays.
+            data_path: Optional file path to npz file. 
+            predicted_data_dir: Optional directory where predictions will be 
+                                stored. 
+        Returns: dict of output predictions.
+        Raises:
+            FileNotFoundError: If data_path isn't found.
+            ValueError: If both data and data_path are specified.
+        """
+        if data_path != None and data == None:
+            try:
+                data = np.load(data_path)
+            except FileNotFoundError as err:
+                print(f"FileNotFoundError: {err}")
+            
+        elif data_path == None and data != None:
+            pass
+        else: 
+            raise ValueError("Can not specify both 'data' and 'data_path")
+        predictions={}
+        for k, d in data.items():  
+            predictions[k+"_pred"] = self._predict_fn({'seq': d})['output']
+        keys = sorted(data.keys())
+        m, M = keys[0], keys[-1]
+        save_file = predicted_data_dir+f"/{m}_{M}_predicted_values"
+        np.savez_compressed(save_file,**predictions)
+        return predictions
